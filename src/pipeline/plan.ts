@@ -123,6 +123,19 @@ export async function plan(
 
 const DIETARY = /vegetarian|vegan|halal|kosher|gluten|pescatarian|no meat|dairy|nut/i;
 
+/**
+ * Reduce an XTrace belief value to a clean diet token. Live XTrace returns prose
+ * recall ("User is vegetarian., The conversation consisted of a single dietary…"),
+ * which must NOT bleed verbatim into the itinerary's diet line. Prefer the matched
+ * dietary keyword; else the first short clause; else drop it.
+ */
+function cleanDiet(value: string): string | null {
+  const m = value.match(DIETARY);
+  if (m) return m[0].toLowerCase();
+  const first = value.split(/[.,;\n]/)[0]?.trim() ?? "";
+  return first && first.length <= 24 ? first : null;
+}
+
 /** Pull durable diet/budget beliefs from XTrace + a one-line culture note. */
 async function gatherItineraryFacts(
   clients: Clients,
@@ -136,10 +149,14 @@ async function gatherItineraryFacts(
   for (const id of participantIds) {
     // "diet" beliefs are dietary by definition; "food" beliefs only when they look it.
     for (const f of await clients.memory.current(id, "diet")) {
-      if (f.value) diets.add(f.value);
+      const d = f.value ? cleanDiet(f.value) : null;
+      if (d) diets.add(d);
     }
     for (const f of await clients.memory.current(id, "food")) {
-      if (f.value && DIETARY.test(f.value)) diets.add(f.value);
+      if (f.value && DIETARY.test(f.value)) {
+        const d = cleanDiet(f.value);
+        if (d) diets.add(d);
+      }
     }
     if (!budget) {
       const b = await clients.memory.current(id, "budget");

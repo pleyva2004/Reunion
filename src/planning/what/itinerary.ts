@@ -87,13 +87,12 @@ export function buildItineraryPrompt(input: ItineraryInput): string {
     facts.cultureNote ? `group note: ${facts.cultureNote}` : null,
   ].filter(Boolean);
 
-  return `You are a concise group-travel planner. Write a ${days}-day itinerary for a trip to ${destination} on ${window.label}.
+  return `You are a concise group-travel planner. Write a LIGHT ${days}-day itinerary for a trip to ${destination} on ${window.label}.
 
 Rules:
 - Plain text ONLY. No Markdown, no asterisks, no headers — iMessage strips formatting.
-- Use short bullet lines starting with "- ".
-- One "Day N (Dow)" header per day, then 2-3 bullets.
-- Terse and decision-oriented; this is a group chat, not a brochure.
+- One "Day N (Dow)" header per day, then EXACTLY 1-2 short bullets starting with "- ".
+- Keep the whole thing under ~10 lines. Terse group-chat tone, not a brochure.
 - Honor these constraints: ${constraints.length ? constraints.join("; ") : "none stated"}.
 - First line: "Trip plan — ${destination}, ${window.label}".
 - Last line: "Reply 👍 if this works."
@@ -157,7 +156,10 @@ export class RocketRideItinerary {
   constructor(private readonly deps: ItineraryGeneratorDeps) {}
 
   async generate(input: ItineraryInput): Promise<string> {
-    const ms = this.deps.timeoutMs ?? (Number(process.env.ROCKETRIDE_TIMEOUT_MS) || 8000);
+    // Itinerary has its OWN (short) timeout, independent of the extractor's. It's
+    // generated once per acting message, so a long degrade window stacks up across
+    // the demo — keep it tight and fall back to the template fast.
+    const ms = this.deps.timeoutMs ?? (Number(process.env.ROCKETRIDE_ITINERARY_TIMEOUT_MS) || 20000);
     const ref: { client?: RocketRideLike } = {};
     try {
       return await withTimeout(this.run(input, ref), ms);

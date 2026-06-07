@@ -19,6 +19,7 @@ import { nextAction } from "./pipeline/nextAction.js";
 import { ConsoleChannel } from "./channel/index.js";
 import { computeCandidateWeekends } from "./planning/when/availability.js";
 import { resolveAvailability, type AvailabilityResolver } from "./planning/when/availabilityResolver.js";
+import { parseTimeframe } from "./planning/what/timeframe.js";
 import { resolveItinerary } from "./planning/what/itinerary.js";
 import { resolveCultureGraph } from "./state/neo4j.js";
 import { buildGroupBrief } from "./planning/what/culture.js";
@@ -30,26 +31,45 @@ import {
 } from "./mocks/seed.js";
 import type { IncomingMessage } from "./contracts/index.js";
 
+const DAY = 24 * 60 * 60 * 1000;
+
 async function main() {
   const clients = createClients();
   const channel = new ConsoleChannel();
-  const calendar = mockCalendar();
   const window: IncomingMessage[] = [];
 
   // Heuristic stub by default; flips to the real RocketRide pipeline when
   // ROCKETRIDE_* is set and USE_STUBS=false. Degrades back on any engine failure.
+  // FAST_EXTRACT forces the instant heuristic even when other tools are live, to keep
+  // the all-live demo under a minute (RocketRide stays visible on the itinerary).
+  const extractLive = !config.useStubs && !config.fastExtract && config.rocketride;
   const doExtract = resolveExtract(
-    { useStubs: config.useStubs, rocketride: config.rocketride },
+    { useStubs: config.useStubs || config.fastExtract, rocketride: config.rocketride },
     extract,
   );
-  const extractMode = !config.useStubs && config.rocketride ? "RocketRide" : "heuristic";
+  const extractMode = extractLive ? "RocketRide" : config.fastExtract ? "heuristic (fast)" : "heuristic";
 
   // Availability: Kevin's live calendar endpoint when configured, else the in-process
   // interval engine over the mock calendar. Degrades to the stub on any endpoint error.
-  const stubAvailability: AvailabilityResolver = async (_trip, ids) => ({
-    candidates: computeCandidateWeekends({ participants: ids, windowKind: "weekend" }, calendar),
-    pendingConnects: [],
-  });
+  // The stub anchors both the busy calendar and the candidate weekends to the trip's
+  // timeframe (parsed from "July" → a July range), then filters to that window — the
+  // same constraint the live path applies via pickWindow, so a July trip yields July
+  // weekends instead of weekends counted from "now".
+  const stubAvailability: AvailabilityResolver = async (trip, ids) => {
+    const range = parseTimeframe(trip.timeframe);
+    const from = range?.start;
+    const weeks = range ? Math.ceil((range.end - range.start) / (7 * DAY)) + 1 : undefined;
+    const calendar = mockCalendar(from);
+    let candidates = computeCandidateWeekends(
+      { participants: ids, windowKind: "weekend" },
+      calendar,
+      { from, weeks },
+    );
+    if (range) {
+      candidates = candidates.filter((c) => c.start >= range.start && c.start < range.end);
+    }
+    return { candidates, pendingConnects: [] };
+  };
   const doAvailability = resolveAvailability(
     { useStubs: config.useStubs, calendar: config.calendar },
     stubAvailability,
@@ -57,7 +77,20 @@ async function main() {
   const availMode = !config.useStubs && config.calendar ? "calendar API" : "stub";
 
   // Itinerary: RocketRide pipeline when configured, else the deterministic template.
-  const doItinerary = resolveItinerary({ useStubs: config.useStubs, rocketride: config.itinerary });
+  // Memoize per (destination, window, diets): the demo replays a conversation, so
+  // plan() would otherwise re-run the LLM on every message for the same trip — one
+  // generation per distinct plan keeps the live run well under a minute.
+  const rawItinerary = resolveItinerary({ useStubs: config.useStubs, rocketride: config.itinerary });
+  const itinCache = new Map<string, Promise<string>>();
+  const doItinerary = (input: Parameters<typeof rawItinerary>[0]): Promise<string> => {
+    const key = `${input.destination}|${input.window.label}|${[...input.facts.diets].sort().join(",")}`;
+    let p = itinCache.get(key);
+    if (!p) {
+      p = rawItinerary(input);
+      itinCache.set(key, p);
+    }
+    return p;
+  };
 
   // Neo4J culture graph (live Aura when configured, else in-memory stub). Recalls
   // each friend's heritage/cuisine/origin and decides per-person food + destination.

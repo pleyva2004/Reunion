@@ -70,6 +70,11 @@ const neo4j =
 
 export const config = {
   useStubs: process.env.USE_STUBS !== "false",
+  // Demo speed knob: run extraction on the instant local heuristic even when the
+  // other tools are live. A live extract is ~11s and runs per message (~44s floor),
+  // so this keeps the all-live demo under a minute while RocketRide stays visible on
+  // the itinerary. Independent of USE_STUBS so state/memory/itinerary stay live.
+  fastExtract: process.env.FAST_EXTRACT === "true",
   channel: (process.env.CHANNEL ?? "iMessage") as "iMessage" | "telegram",
   rocketride,
   itinerary,

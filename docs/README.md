@@ -5,6 +5,10 @@ This directory contains core product documentation synced from Notion.
 ## Contents
 
 - `PRD.md` — Product Requirements Document for the Group Travel Planning Agent.
+- `connections/photon-spectrum.md` — Photon / Spectrum iMessage inbound connection reference (from Context7).
+- `connections/imessage.md` — advanced-imessage-kit connection reference, including polls (from Context7).
+- `connections/butterbase.md` — Butterbase backend connection reference (app, REST API, schema), verified against the live `reunion` app.
+- `contracts/intent-to-poll-integration.md` — iMessage integration contract: intent classification → availability poll → user roster.
 
 ## Related docs
 

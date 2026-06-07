@@ -1,0 +1,22 @@
+{
+  "name": "reunion-intent-gate",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "On-device travel-intent gate for Reunion (Variant B: Apple Foundation Models).",
+  "scripts": {
+    "sidecar:build": "cd sidecar && swift build -c release",
+    "sidecar:smoke": "cd sidecar && swift build -c release >/dev/null && printf '%s\\n' '{\"window\":\"we should do a trip to Lisbon in September\"}' '{\"window\":\"did you watch the game last night\"}' | ./.build/release/intent-sidecar",
+    "dev": "tsx src/index.ts",
+    "start": "npm run sidecar:build && tsx src/index.ts"
+  },
+  "dependencies": {
+    "@photon-ai/imessage-kit": "^3.0.0",
+    "spectrum-ts": "^1.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.3"
+  }
+}

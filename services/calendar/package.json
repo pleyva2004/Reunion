@@ -1,0 +1,31 @@
+{
+  "name": "reunion-calendar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "seed-link": "tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/seed-connect-link.mts",
+    "provision-butterbase": "tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/provision-butterbase.mts"
+  },
+  "dependencies": {
+    "@butterbase/sdk": "^2.4.0",
+    "googleapis": "^173.0.0",
+    "next": "16.2.7",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.7",
+    "tsx": "^4.22.4",
+    "typescript": "^5"
+  }
+}

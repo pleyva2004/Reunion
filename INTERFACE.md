@@ -3,6 +3,9 @@
 This is the seam between the calendar component and the rest of the system (RocketRide /
 XTrace, owned by teammates). Freeze this early; integration day depends on it.
 
+**Formal integration contract:** `docs/contracts/roster-to-calendar-integration.md` (maps upstream
+`UserRoster` → this input/output, transport, connect-link handoff, and ownership table).
+
 ## The four handshakes to confirm with teammates
 
 1. **What triggers us & what we receive** — defined below (Input).

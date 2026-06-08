@@ -5,6 +5,7 @@ This directory contains core product documentation synced from Notion.
 ## Contents
 
 - `PRD.md` — Product Requirements Document for the Group Travel Planning Agent.
+- `contracts/roster-to-calendar-integration.md` — integration contract: user roster → calendar availability (`common_free`).
 
 ## Related docs
 

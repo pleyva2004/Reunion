@@ -7,14 +7,14 @@
 
 ## Purpose
 
-Define the boundary contract between Reunion's on-device intent layer and Photon's iMessage layer for the first coordination artifact: a native availability poll sent to the group chat, ending with a structured user roster.
+Define the boundary contract between Reunion's intent layer (XTrace), backend orchestration (RocketRide + Butterbase), and Photon's iMessage layer for the first coordination artifact: a native availability poll sent to the group chat, ending with a structured user roster.
 
-**Intent runs on-device, before the cloud.** Photon grabs each inbound iMessage and calls an on-device CoreML/Swift classifier that resolves the **WHERE** (travel intent + destination). Only messages that pass the on-device gate are forwarded to the cloud backend. The backend then asks Photon to send a native poll that resolves the **WHO** (who is in). This keeps the local-filter-before-cloud posture of ADR-007 / ADR-014, now realized as an on-device model.
+**XTrace classifies and persists intent.** XTrace upserts each classified message to Butterbase as an `IntentEvent` row. A Butterbase realtime INSERT on `intent_events` triggers RocketRide, which maps the row, upserts trip/poll state, and hands Photon a `CreateAvailabilityPollRequest`. Photon sends the native poll that resolves the **WHO** (who is in).
 
-- **WHERE** — destination/timeframe, resolved on-device by the CoreML/Swift classifier.
+- **WHERE** — destination, resolved by XTrace and stored in `intent_events.location`.
 - **WHO** — availability, resolved by the iMessage poll → roster.
 
-**Photon is the iMessage connector.** Inbound text arrives via Spectrum (`spectrum-ts` + iMessage provider); poll create/vote/parse always goes through `@photon-ai/advanced-imessage-kit`. Photon also invokes the on-device classifier and bridges to the backend. Both Photon surfaces are shown as a single connector participant below.
+**Photon is the iMessage poll connector.** Poll create/vote/parse goes through `@photon-ai/advanced-imessage-kit`. Photon resolves `chat_id` → `chat_guid`, sends polls, and persists votes. Photon does **not** own the canonical intent trigger.
 
 ## Integration boundaries (ownership)
 
@@ -22,48 +22,120 @@ The contract is the seam between independently built components. Each owner impl
 
 | Component | Owner role | Responsibility |
 |-----------|------------|----------------|
-| **On-device classifier (CoreML / Swift)** | Intent (WHERE) | Classifies travel intent + destination on device; applies the gate before any cloud call |
-| **Photon** | Connector | Inbound text (Spectrum webhook), calls the on-device classifier, bridges to the backend, native poll create/vote/parse (advanced-imessage-kit) |
-| **RocketRide** | Backend orchestration | Receives classified messages from Photon, drives the poll flow, normalizes votes, emits the roster |
-| **Butterbase** | Backend state | Transactional trip/poll/vote state and plan artifacts |
-| **XTrace** | Knowledge | Stores group-chat knowledge: roster facts, participants, group context |
+| **XTrace** | Knowledge + intent | Classifies travel intent; **upserts `intent_events`** to Butterbase (canonical WHERE + trigger row); receives terminal roster writeback |
+| **Butterbase** | Backend state | Stores `intent_events`, trips, polls, votes; broadcasts INSERT via realtime when enabled |
+| **RocketRide** | Backend orchestration | Subscribes to `intent_events` INSERT, applies gate, maps row → poll ingress, drives completion, emits roster |
+| **Photon** | iMessage connector | Resolves `chat_id` → `chat_guid`, `sdk.polls.create`, vote persistence via advanced-imessage-kit |
 
-"Backend" = RocketRide orchestration + Butterbase state (+ XTrace knowledge). Photon hands the classified message to the backend and receives a poll request back.
+"Backend" = Butterbase state + RocketRide orchestration (+ XTrace knowledge). For poll creation, RocketRide consumes an `IntentEvent` upsert and Photon receives a `CreateAvailabilityPollRequest` back from Butterbase ingress.
 
 ## Flow overview
 
 ```mermaid
 sequenceDiagram
     participant Chat as iMessage Group Chat
-    participant PH as Photon (Spectrum + advanced-imessage-kit)
-    participant SW as On-device CoreML/Swift
-    participant RR as RocketRide (backend)
-    participant BB as Butterbase (state)
-    participant XT as XTrace (knowledge)
+    participant XT as XTrace
+    participant BB as Butterbase
+    participant RT as Realtime_ws
+    participant RR as RocketRide
+    participant PH as Photon
+    participant Chat2 as iMessage Group Chat
 
-    Chat->>PH: inbound message
-    PH->>SW: classify(message) on-device
-    SW-->>PH: IntentClassificationResult (intent + WHERE)
-    alt travel_intent >= threshold
-        PH->>RR: forward classified message
-        RR->>BB: upsert Trip + Group context (WHERE)
-        RR-->>PH: CreateAvailabilityPollRequest
-        PH->>Chat: native iMessage poll (resolve WHO)
-        Chat-->>PH: poll votes (async)
-        PH-->>RR: PollVoteRecord (first vote only)
-        RR->>BB: persist Poll + votes
-        RR-->>RR: emit UserRoster
-        RR->>XT: write group knowledge + roster facts
-    else below threshold
-        PH-->>PH: drop on-device (no cloud call)
-    end
+    Chat->>XT: inbound message classified
+    XT->>BB: UPSERT intent_events
+    BB->>RT: pg_notify INSERT
+    RT->>RR: change event
+    RR->>RR: gate + map row
+    RR->>PH: resolve chat_id to chat_guid
+    RR->>BB: acceptClassification upsert trip/poll
+    BB-->>RR: CreateAvailabilityPollRequest
+    RR->>PH: send poll
+    PH->>Chat2: native iMessage poll (resolve WHO)
+    Chat2-->>PH: poll votes (async)
+    PH-->>BB: PollVoteRecord (first vote only)
+    RR->>BB: read poll + vote state
+    RR-->>RR: emit UserRoster
+    RR->>XT: write group knowledge + roster facts
 ```
 
-## Step 1 — Input: On-device intent classification
+## Step 0 — Input: `IntentEvent` upsert (canonical trigger)
 
-Produced on-device by the CoreML/Swift classifier (ADR-007, ADR-014), which Photon invokes for each inbound message. This step resolves the **WHERE** (intent + destination). The gate is applied on-device: only passing messages are forwarded to the cloud backend, so no cloud call happens for non-travel chatter.
+XTrace writes one row per classified message to the live Butterbase `intent_events` table (migration `add_intent_events`).
 
-### `IntentClassificationResult`
+### `IntentEvent`
+
+```json
+{
+  "id": "uuid",
+  "message_id": "string",
+  "channel": "iMessage",
+  "chat_id": "string",
+  "chat_name": "string | null",
+  "chat_kind": "group | dm",
+  "sender": "string",
+  "is_from_me": false,
+  "text": "string",
+  "context_window": "string",
+  "is_travel_intent": true,
+  "confidence": 0.9,
+  "location": "string | null",
+  "created_at": "ISO-8601"
+}
+```
+
+### Upsert semantics
+
+- `message_id` is unique (dedup key). XTrace writes one row per classified message.
+- Duplicate `message_id` upserts MUST NOT create duplicate polls (`polls.trigger_message_id` dedup).
+
+## Step 0.5 — Event trigger (Butterbase realtime)
+
+Per [Butterbase Realtime](https://docs.butterbase.ai/core-concepts/realtime/):
+
+| Step | Action |
+|------|--------|
+| Enable | `configure_realtime({ tables: ["intent_events"] })` — installs pg_notify DB triggers |
+| Subscribe | RocketRide connects to `wss://api.butterbase.ai/v1/{app_id}/realtime` with service key |
+| Subscribe msg | `{ "type": "subscribe", "table": "intent_events" }` |
+| Handler | On `{ "type": "change", "op": "INSERT", "table": "intent_events" }`, process `record` |
+| Reconnect | Re-fetch recent rows: `GET /intent_events?is_travel_intent=eq.true&order=created_at.desc` (events may be lost during LISTEN reconnection) |
+
+Optional filter subscription: `{ "type": "subscribe", "table": "intent_events", "filter": { "is_travel_intent": true } }`.
+
+## Step 1 — Gate + map `IntentEvent`
+
+RocketRide applies the gate on the raw `IntentEvent` before mapping. Rows that fail are dropped with `intent.gate_failed`.
+
+### Gate rules (`IntentEvent`)
+
+| Rule | Field | Value |
+|------|-------|-------|
+| Travel detected | `is_travel_intent` | `true` |
+| Confidence | `confidence` | ≥ `0.6` (tunable via `INTENT_CONFIDENCE_THRESHOLD`) |
+| Platform | `channel` | `iMessage` (case-insensitive → `imessage`) |
+| Chat present | `chat_id` | non-empty |
+| Dedup | `message_id` | must not already exist in `polls.trigger_message_id` |
+| Ignore poll echoes | `text` | MUST NOT match poll title/options (e.g. `Can everyone make this trip?` with `• Yes` / `• No`) |
+
+### Field mapping: `IntentEvent` → `IntentClassificationResult`
+
+RocketRide normalizes before calling `IntentIngressService.acceptClassification()`:
+
+| `IntentEvent` | `IntentClassificationResult` |
+|---------------|------------------------------|
+| `message_id` | `message_id`, `context.trigger_message_id` |
+| `channel` | `platform: "imessage"` |
+| resolved `chat_guid` | `chat_guid` (from `chat_id` — see Step 1.5) |
+| `text` | `text` |
+| `created_at` | `classified_at` |
+| `is_travel_intent` | `travel_intent.detected` |
+| `confidence` | `travel_intent.confidence` |
+| `location` | `extracted.destination` |
+| — | `extracted.timeframe: null` (not in live schema) |
+| — | `travel_intent.signal: "mixed"` (default until XTrace adds it) |
+| — | `should_orchestrate: true` when gate passes |
+
+### Internal `IntentClassificationResult` (normalized shape)
 
 ```json
 {
@@ -86,21 +158,19 @@ Produced on-device by the CoreML/Swift classifier (ADR-007, ADR-014), which Phot
 }
 ```
 
-### Gate rules
+## Step 1.5 — Chat resolution (`chat_id` → `chat_guid`)
 
-| Rule | Value |
-|------|-------|
-| `should_orchestrate` | Must be `true` |
-| `travel_intent.detected` | Must be `true` |
-| `travel_intent.confidence` | Must be ≥ `0.6` (tunable) |
-| `platform` | Must be `imessage` |
-| Required routing field | `chat_guid` (e.g. `iMessage;+;chat123456`) |
+Live `intent_events.chat_id` is an XTrace identifier (hash), not an advanced-imessage-kit `chat_guid` (`iMessage;+;...`). Photon MUST resolve before `sdk.polls.create`:
 
-If the gate fails, the message is dropped on-device: Photon does not forward it to the backend, and no trip, poll, or cloud work is created.
+1. If `chat_id` already matches `iMessage;` prefix, use as `chat_guid` directly.
+2. `sdk.chats.getChats()` filtered by `chat_name` + `chat_kind=group`, **or**
+3. Local Messages DB lookup by name (`resolveGroupChatGuidByName`).
+
+On failure, emit `CHAT_RESOLUTION_FAILED` and abort poll creation.
 
 ## Step 2 — Action: Create availability poll (resolve WHO)
 
-After Photon forwards a passing classification, the backend (RocketRide) upserts trip/group context from the WHERE and emits a `CreateAvailabilityPollRequest` back to Photon, which sends the native poll to resolve the WHO.
+RocketRide calls Butterbase ingress with the mapped `IntentClassificationResult`. Butterbase upserts trip/group/poll context and returns a `CreateAvailabilityPollRequest`. Photon sends the native poll.
 
 ### `CreateAvailabilityPollRequest`
 
@@ -114,7 +184,7 @@ After Photon forwards a passing classification, the backend (RocketRide) upserts
   },
   "poll": {
     "title": "Can everyone make this trip?",
-    "options": ["Yes", "No", "Maybe"],
+    "options": ["Yes", "No"],
     "kind": "availability"
   },
   "context": {
@@ -129,9 +199,8 @@ After Photon forwards a passing classification, the backend (RocketRide) upserts
 
 | Option | Meaning |
 |--------|---------|
-| **Yes** | Participant is in / available for the trip |
+| **Yes** | Participant is in for the trip |
 | **No** | Participant cannot make it |
-| **Maybe** | Tentative — wants to go but has open constraints |
 
 ### iMessage adapter
 
@@ -204,6 +273,8 @@ A participant's **first** vote on a poll is persisted; subsequent votes for the 
 }
 ```
 
+Votes are **persisted on each event**; the roster is **not** emitted per vote.
+
 ### Normalized `PollVoteRecord`
 
 ```json
@@ -211,24 +282,25 @@ A participant's **first** vote on a poll is persisted; subsequent votes for the 
   "poll_id": "uuid",
   "participant_handle": "string",
   "option_identifier": "string",
-  "option_text": "Yes | No | Maybe",
+  "option_text": "Yes | No",
   "voted_at": "ISO-8601"
 }
 ```
 
 `option_identifier` is retained as the stable key from the native event; `option_text` is the human-readable label resolved via `getOptionTextById`.
 
-### Completion trigger
+### Completion trigger (v1)
 
-Emit `PollCompletedEvent` when either:
+Close the poll and emit `UserRoster` when either:
 
-- All known group participants have voted, or
-- A timeout elapses (default: 24h for demo, 48h production), or
-- An operator sends `what's next?` / `summarize the trip`
+- **All voted** — every participant in the snapshot has cast a vote → close immediately, or
+- **24h timeout** — default `COMPLETION_TIMEOUT_MS=86400000` → close with partial roster (`complete: false`)
+
+Individual votes are saved as they arrive; the roster is emitted **once** on close.
 
 ## Step 4 — Output: User roster (terminal artifact)
 
-The flow **ends** by emitting a `UserRoster` JSON object. This is the knowledge handoff: roster facts and group context are written to **XTrace** (the group-chat knowledge layer), while poll/trip/vote **state** already lives in Butterbase.
+The flow **ends** by emitting a `UserRoster` JSON object. This is the knowledge handoff: roster facts and group context are written to **XTrace**, while poll/trip/vote **state** lives in Butterbase.
 
 ### `UserRoster`
 
@@ -248,7 +320,7 @@ The flow **ends** by emitting a `UserRoster` JSON object. This is the knowledge 
     {
       "name": "Bob Martinez",
       "phone_number": "+14155559876",
-      "availability": "maybe"
+      "availability": "no"
     }
   ]
 }
@@ -262,14 +334,14 @@ The flow **ends** by emitting a `UserRoster` JSON object. This is the knowledge 
 |-------|------|--------|----------|
 | `name` | `string` | Contacts lookup via `nameMap.get(handle)` (built from `sdk.contacts.getContacts()`); fallback to `participant_handle` | Yes |
 | `phone_number` | `string` | E.164 from `participant_handle` | Yes |
-| `availability` | `"yes" \| "no" \| "maybe"` | The participant's persisted (first) vote `option_text`, lowercased | Yes |
+| `availability` | `"yes" \| "no"` | The participant's persisted (first) vote `option_text`, lowercased | Yes |
 
 ### Inclusion rules
 
 A user appears in `users` when:
 
 1. They are a participant in the target iMessage group chat, **and**
-2. They cast a vote on the availability poll (any of `Yes` / `No` / `Maybe`).
+2. They cast a vote on the availability poll (`Yes` or `No`).
 
 Their `availability` carries the actual vote, so downstream consumers (not this contract) decide who is "in." Non-voters are excluded from the roster but may be tracked separately in Butterbase as `TripParticipant.status = "pending"`.
 
@@ -294,8 +366,9 @@ for each voted participant_handle:
 
 | Error code | Condition | Behavior |
 |------------|-----------|----------|
-| `INTENT_GATE_FAILED` | On-device classifier below threshold | Drop on-device, no cloud/backend call |
-| `MISSING_CHAT_GUID` | `chat_guid` absent or invalid | Fail fast, log |
+| `INTENT_GATE_FAILED` | `IntentEvent` below threshold or poll echo | Drop row, log `intent.gate_failed` |
+| `CHAT_RESOLUTION_FAILED` | `chat_id` cannot map to `chat_guid` | Fail fast, log |
+| `MISSING_CHAT_GUID` | Resolved `chat_guid` absent or invalid | Fail fast, log |
 | `POLL_SEND_FAILED` | `sdk.polls.create` error | Retry 2x, then surface to chat |
 | `PARTIAL_ROSTER` | Timeout with <100% votes | Emit roster with voted users only; set `complete: false` |
 
@@ -304,7 +377,8 @@ Vote changes are not an error: a later vote for an already-voted `(poll_id, part
 ## Idempotency
 
 - `correlation_id` is generated once per intent-triggered poll.
-- **Poll-creation dedup key:** `trigger_message_id`. Duplicate classifier hits for the same `message_id` MUST NOT create duplicate polls. When `trip_id` is null, dedup additionally on `(chat_guid, poll.kind)` so the first availability poll for a chat isn't duplicated before a trip exists.
+- **Poll-creation dedup key:** `trigger_message_id` (= `intent_events.message_id`). Duplicate upserts for the same `message_id` MUST NOT create duplicate polls.
+- When `trip_id` is null, dedup additionally on `(chat_guid, poll.kind)` so the first availability poll for a chat isn't duplicated before a trip exists.
 - Butterbase stores a `(trip_id, poll.kind)` unique constraint for `availability` once `trip_id` is assigned.
 - **Vote dedup:** first vote per `(poll_id, participant_handle)` wins (see Step 3).
 
@@ -312,32 +386,47 @@ Vote changes are not an error: a later vote for an already-voted `(poll_id, part
 
 Pipeline stages should log:
 
-1. `intent.classified` — on-device confidence + extracted WHERE (destination/timeframe)
-2. `intent.forwarded` — passing message handed from Photon to the backend
-3. `poll.requested` — `chat_guid` + options
-4. `poll.sent` — `external_poll_guid`
-5. `poll.vote.received` — per `participant_handle`
-6. `vote.ignored` — duplicate vote dropped (first-vote-wins)
-7. `roster.emitted` — final `users` array + `complete`
-8. `knowledge.written` — roster + group context persisted to XTrace
+1. `intent.upserted` — XTrace writes `intent_events` (XTrace-side)
+2. `intent.received` — RocketRide gets realtime INSERT
+3. `intent.mapped` — row normalized + chat resolved
+4. `intent.gate_failed` — below threshold or poll echo
+5. `poll.requested` — `chat_guid` + options
+6. `poll.sent` — `external_poll_guid`
+7. `poll.vote.received` — per `participant_handle`
+8. `vote.ignored` — duplicate vote dropped (first-vote-wins)
+9. `roster.emitted` — final `users` array + `complete`
+10. `knowledge.written` — roster + group context persisted to XTrace
 
 ## Resolved decisions
 
-1. **Intent location** — classification runs on-device (CoreML/Swift), invoked by Photon, before any cloud call. WHERE is resolved here; WHO is resolved by the poll.
-2. **Inbound path** — Photon receives inbound iMessage (Spectrum), calls the on-device classifier, and forwards only passing messages to the backend; poll **votes** always arrive via advanced-imessage-kit `sdk.on('new-message')`.
-3. **Poll options** — `Yes` / `No` / `Maybe`.
+1. **Intent trigger** — XTrace upserts `intent_events` to Butterbase; realtime INSERT is the canonical poll-creation trigger.
+2. **Poll path** — RocketRide maps + gates → Butterbase ingress → Photon `sdk.polls.create`; votes via advanced-imessage-kit.
+3. **Poll options** — `Yes` / `No` only (no `Maybe`).
 4. **Vote changes** — first-vote-wins in v1; no revisions tracked.
+5. **Poll close** — all voted (immediate) or 24h timeout; roster emitted once on close.
+6. **State persistence** — trip/poll/vote state in Butterbase when credentials configured (`src/butterbase/butterbase-store.ts`).
 
 ## Open decisions
 
-1. **Completion timeout** — 24h demo default vs configurable per trip.
-2. **Non-voter representation in XTrace** — omit (current) vs record as `status: "pending"` knowledge.
+1. **Non-voter representation in XTrace** — omit (current) vs record as `status: "pending"` knowledge.
+2. **`travel_intent.signal` on `IntentEvent`** — default `mixed` until XTrace adds an explicit field.
+
+## Appendix — Legacy: Photon direct ingress (non-canonical)
+
+For monolithic dev, integration tests, and demos without XTrace realtime:
+
+- Photon receives inbound iMessage via Spectrum webhook/listener.
+- On-device `HeuristicClassifier` (stand-in for CoreML/Swift) produces `IntentClassificationResult`.
+- Photon POSTs to `POST /butterbase/intent-classified` (split deploy) or calls ingress in-process.
+- Same poll send + vote path as above.
+
+This path is **not** the production trigger. See `src/photon/connector.ts` (`handleInbound`) and `src/butterbase/routes.ts`.
 
 ## Related docs
 
+- `docs/connections/butterbase.md` — `intent_events` table + realtime requirement
 - `docs/connections/imessage.md`
-- `docs/connections/photon-spectrum.md` — Spectrum iMessage provider (inbound only)
+- `docs/connections/photon-spectrum.md` — Spectrum iMessage provider (legacy inbound)
 - `docs/PRD.md` — FR1, FR5, FR6
-- `ADR/ADR-007` — local intent filter (realized as on-device CoreML/Swift)
+- `ADR/ADR-005` — XTrace memory vs Butterbase state
 - `ADR/ADR-013` — RocketRide orchestration
-- `ADR/ADR-014` — filter intent before cloud orchestration

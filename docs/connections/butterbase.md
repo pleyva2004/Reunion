@@ -76,7 +76,32 @@ A full CRUD API is generated automatically once tables exist.
 
 ## Current schema
 
-Two tables exist (migration `create_participants_and_oauth_tokens`, applied 2026-06-05).
+Eight tables exist on the live reunion app (verified 2026-06-05).
+
+### `intent_events` (XTrace trigger)
+
+Written by XTrace when a message is classified. One row per `message_id`. RocketRide subscribes to INSERT via Butterbase realtime to trigger poll creation.
+
+| Column | Type | Constraint |
+|--------|------|------------|
+| `id` | uuid | default `gen_random_uuid()` |
+| `message_id` | text | unique (`intent_events_message_id_idx`) |
+| `channel` | text | e.g. `iMessage` |
+| `chat_id` | text | XTrace chat identifier (hash; not `chat_guid`) |
+| `chat_name` | text | Group display name for Photon resolution |
+| `chat_kind` | text | `group` or `dm` |
+| `sender` | text | |
+| `is_from_me` | boolean | |
+| `text` | text | Message body |
+| `context_window` | text | Recent messages context |
+| `is_travel_intent` | boolean | Gate field |
+| `confidence` | float8 | Gate field (threshold 0.6) |
+| `location` | text | Extracted destination |
+| `created_at` | text | |
+
+Migration: `add_intent_events` (2026-06-05).
+
+**Realtime requirement:** `configure_realtime({ tables: ["intent_events"] })` must be enabled before RocketRide receives INSERT events. Check status: `GET /v1/{app_id}/realtime/config`.
 
 ### `participants`
 
@@ -131,7 +156,27 @@ Butterbase also runs as an MCP server for agent-driven schema/auth/function mana
 | Participant identity | `participants` table (`phone` unique) |
 | Google linkage | `participants.google_email` |
 | OAuth token storage | `oauth_tokens` (keyed by `participant_id`) |
+| Intent trigger | `intent_events` — XTrace upserts; RocketRide listens via realtime INSERT |
+| Trip / poll / vote state | `trips`, `polls`, `poll_votes`, `chat_groups`, `trip_participants` (applied on startup via `src/butterbase/schema.ts`) |
+| Poll creation ingress | RocketRide maps `IntentEvent` → `IntentClassificationResult`; Butterbase returns `CreateAvailabilityPollRequest` to Photon |
+| Poll-flow orchestration | RocketRide reads Butterbase state for completion/roster; `ButterbaseStore` when `BUTTERBASE_*` env vars are set; in-memory fallback in dev stub |
 | Programmatic access | Service key (`bb_sk_`) as Bearer token |
+
+### Poll-flow tables (RocketRide)
+
+Created by `POST /schema/apply` on service startup when Butterbase credentials are configured:
+
+| Table | Purpose |
+|-------|---------|
+| `trips` | One per iMessage chat; stores extracted destination + timeframe |
+| `polls` | Availability poll records; `status` is `open` until closed (`all_voted` or `timeout`) |
+| `poll_votes` | First vote per `(poll_id, participant_handle)` |
+| `chat_groups` | Participant snapshot per chat |
+| `trip_participants` | Per-trip handle status (`pending` / `voted`) |
+
+Poll creation flow (canonical): XTrace upserts `intent_events` → Butterbase realtime INSERT → RocketRide gates + maps → `upsertTrip` + create poll record → returns `CreateAvailabilityPollRequest` → Photon sends native iMessage poll.
+
+Legacy path (dev/tests): Photon on-device classifier → `POST /butterbase/intent-classified`.
 
 ## Connection test (verified 2026-06-05)
 

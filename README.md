@@ -1,4 +1,5 @@
 # Group Travel Planning Agent (Reunion)
+See Demo: https://reunion-ecru-ten.vercel.app
 
 Reunion is a messaging-native group travel planning agent built for the Agentic AI SF Hackathon. It detects travel intent in group chat, remembers constraints and preferences, and turns casual conversation into concrete coordination steps.
 
